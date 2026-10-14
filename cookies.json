@@ -1,0 +1,28 @@
+[
+  {
+    "domain": "rarestudy.testuk.org",
+    "expirationDate": 1794583423.849966,
+    "hostOnly": true,
+    "httpOnly": true,
+    "name": "session",
+    "path": "/",
+    "sameSite": null,
+    "secure": false,
+    "session": false,
+    "storeId": null,
+    "value": ".eJwNyMlSgzAAANB_ydlDKMvU3lC2hqBpsSy9ZCoEoQVCCGQMjv-u7_h-AJ3YPNxGNi7gsMwrewKzpJJJ2fERHIBK1IdPfCvcRJBaFU9XzssLRMrOvgyzMaNI564jy5a_hCkW_YC956ar7GlC17xMm3aA7_uOMpPcxBLjSTivbwYs9dlfv3kl-_asnVj-x26xauhaJLCbOC34wyM6cfP7XVJd9_54QvMQR3WCj3HnfBIzO67MQHtUh8XmB5f8BOFuc6XKPM6iQmNDUPUQVxP8_gHnA02O.as5M_w.AzCxXJ7WOqzMQ6eVbxRO2YamReQ"
+  },
+  {
+    "domain": "rarestudy.testuk.org",
+    "expirationDate": 1791985322.328081,
+    "hostOnly": true,
+    "httpOnly": false,
+    "name": "session_expiry",
+    "path": "/",
+    "sameSite": "no_restriction",
+    "secure": true,
+    "session": false,
+    "storeId": null,
+    "value": "1791985322201"
+  }
+]
