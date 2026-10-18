@@ -12,3 +12,8 @@ wheels/
 
 # Downloaded media
 downloads/
+
+SilverSpoon/
+
+# Local session cookies (rotated daily - never commit)
+cookies.json

@@ -1,10 +1,13 @@
 [project]
 name = "rare-study-downloader"
 version = "0.1.0"
-description = "Add your description here"
+description = "Download DASH lectures from rarestudy.testuk.org (CLI + PyQt6 GUI)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.15.0",
     "requests>=2.34.2",
 ]
+
+[project.optional-dependencies]
+gui = ["PyQt6>=6.6"]

@@ -1,7 +1,6 @@
 import argparse
 import sys
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List
@@ -9,7 +8,8 @@ from urllib.parse import urlparse
 
 import requests
 
-from catalog import Catalog, CatalogError, Chapter, CourseRef, Lecture
+from catalog import CatalogError, Chapter, Lecture
+from cookies_store import CookieStore
 from config import (
     BASE_URL,
     COOKIES_FILE,
@@ -18,19 +18,38 @@ from config import (
     VIDEO_DOWNLOAD_ATTEMPTS,
     VIDEO_DOWNLOAD_WORKERS,
 )
-from downloader import DownloadError, RareStudyDownloader, ResolveError, probe_duration
-from state import StateStore
-from utils import duration_to_seconds, load_cookies, sanitize_filename
+from downloader import DownloadError, RareStudyDownloader, ResolveError
+from jobs import (
+    MIN_VALID_SIZE,
+    STATUS_CANCELLED,
+    STATUS_FAILED,
+    JobOptions,
+    load_collection,
+    make_state,
+    plan_chapter_outputs,
+    run_lecture_job,
+    verify_output,
+)
+from utils import sanitize_filename
 
-MIN_VALID_SIZE = 10 * 1024
-VERIFY_TOLERANCE_RATIO = 0.02
-VERIFY_TOLERANCE_MIN = 20.0
 PRINT_LOCK = threading.Lock()
 
 
 def log(message: str) -> None:
     with PRINT_LOCK:
         print(message, flush=True)
+
+
+def _enable_utf8_output() -> None:
+    """Never crash the CLI printing non-ASCII titles to a cp1252 console/pipe."""
+
+    if sys.platform != "win32":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, ValueError):
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,34 +114,6 @@ def print_chapters(chapters: List[Chapter]) -> None:
         print(f"  {idx:>3}. {chapter.name}  [{len(chapter.lectures)} videos]")
 
 
-def unique_name(name: str, used: set) -> str:
-    base = sanitize_filename(name, "video")
-    candidate = base
-    counter = 2
-    while candidate.lower() in used:
-        candidate = f"{base} ({counter})"
-        counter += 1
-    used.add(candidate.lower())
-    return candidate
-
-
-def verify_output(output: Path, expected: float, enabled: bool):
-    """Probe output with ffprobe and compare against expected seconds.
-
-    Returns (ok, measured_seconds).
-    """
-
-    if not enabled:
-        return True, None
-    measured = probe_duration(output)
-    if measured is None:
-        return False, None
-    if not expected:
-        return True, measured
-    tolerance = max(VERIFY_TOLERANCE_MIN, expected * VERIFY_TOLERANCE_RATIO)
-    return abs(measured - expected) <= tolerance, measured
-
-
 def select_chapters(args, chapters: List[Chapter]) -> List[Chapter]:
     if args.chapters is not None:
         return [chapters[i] for i in parse_spec(args.chapters, len(chapters))]
@@ -182,23 +173,16 @@ def download_single(args, downloader: RareStudyDownloader) -> int:
     return 0
 
 
-def download_collection(args, downloader: RareStudyDownloader, cookies) -> int:
-    ref = CourseRef.from_url(args.url)
-    catalog = Catalog(cookies)
-    ref.subject_name = catalog.subject_name(ref.program_id, ref.subject_id) or ref.batch_name or ref.subject_id
-
-    chapters = catalog.chapters(ref)
+def download_collection(args, downloader: RareStudyDownloader, store: CookieStore) -> int:
+    plan = load_collection(args.url, store.cookies, args.output_dir)
+    chapters = plan.chapters
     if not chapters:
         print("No chapters found for this subject.", file=sys.stderr)
         return 1
 
-    for chapter in chapters:
-        catalog.lectures(ref, chapter)
-
     if args.list:
-        print(f"Subject: {ref.subject_name}")
-        total = sum(len(c.lectures) for c in chapters)
-        print(f"Chapters: {len(chapters)}  Videos: {total}")
+        print(f"Subject: {plan.subject_name}")
+        print(f"Chapters: {len(chapters)}  Videos: {plan.total_lectures}")
         print_chapters(chapters)
         return 0
 
@@ -207,10 +191,17 @@ def download_collection(args, downloader: RareStudyDownloader, cookies) -> int:
         print("Nothing selected.")
         return 0
 
-    subject_dir = Path(args.output_dir) / sanitize_filename(ref.subject_name, ref.subject_id)
-    subject_dir.mkdir(parents=True, exist_ok=True)
-    state = StateStore(subject_dir / ".state.json")
-    stats = {"downloaded": 0, "skipped": 0, "failed": 0, "planned": 0}
+    plan.subject_dir.mkdir(parents=True, exist_ok=True)
+    state = make_state(plan)
+    options = JobOptions(
+        quality=args.quality,
+        container=args.container,
+        force=args.force,
+        verify=args.verify,
+        retries=args.retries,
+        workers=args.workers,
+    )
+    stats = {"downloaded": 0, "skipped": 0, "failed": 0, "cancelled": 0, "planned": 0}
     failures: List[str] = []
 
     tasks: List[tuple] = []
@@ -218,41 +209,53 @@ def download_collection(args, downloader: RareStudyDownloader, cookies) -> int:
         lectures = select_lectures(args, chapter)
         if not lectures:
             continue
-        chapter_dir = subject_dir / chapter.folder
-        chapter_dir.mkdir(parents=True, exist_ok=True)
-        used: set = set()
-        width = max(2, len(str(len(chapter.lectures))))
+        planned = plan_chapter_outputs(plan, chapter, lectures)
         print(f"\n=== {chapter.name} ({len(lectures)} videos) ===")
-        for lecture in lectures:
-            base = unique_name(lecture.name, used)
-            prefix = f"{lecture.order:0{width}d} - " if lecture.order else ""
-            output = chapter_dir / f"{prefix}{base}.mp4"
-            if args.dry_run:
+        if args.dry_run:
+            for _lecture, output in planned:
                 print(f"  plan   {output.relative_to(Path(args.output_dir))}")
                 stats["planned"] += 1
-                continue
+            continue
+        for lecture, output in planned:
             tasks.append((lecture, output))
+
+    def run(lecture: Lecture, output: Path, show_progress: bool):
+        return run_lecture_job(
+            options,
+            downloader,
+            plan.ref,
+            lecture,
+            output,
+            state,
+            plan.subject_dir,
+            on_log=log,
+            store=store,
+            show_progress=show_progress,
+        )
 
     if tasks:
         parallel = max(1, min(args.parallel, len(tasks)))
         if parallel == 1:
             for lecture, output in tasks:
-                status = download_lecture(args, downloader, ref, lecture, output, state, subject_dir, show_progress=True)
-                stats[status] += 1
-                if status == "failed":
+                result = run(lecture, output, True)
+                stats[result.status] += 1
+                if result.status == STATUS_FAILED:
                     failures.append(lecture.name)
+
+                if result.status == STATUS_CANCELLED:
+                    break
         else:
             log(f"\nDownloading {len(tasks)} videos with {parallel} parallel workers...")
             with ThreadPoolExecutor(max_workers=parallel) as pool:
                 futures = {
-                    pool.submit(download_lecture, args, downloader, ref, lecture, output, state, subject_dir, False): lecture
+                    pool.submit(run, lecture, output, False): lecture
                     for lecture, output in tasks
                 }
                 for future in as_completed(futures):
                     lecture = futures[future]
-                    status = future.result()
-                    stats[status] += 1
-                    if status == "failed":
+                    result = future.result()
+                    stats[result.status] += 1
+                    if result.status == STATUS_FAILED:
                         failures.append(lecture.name)
 
     print("\nSummary: " + ", ".join(f"{k}={v}" for k, v in stats.items() if v))
@@ -263,46 +266,8 @@ def download_collection(args, downloader: RareStudyDownloader, cookies) -> int:
     return 0 if stats["failed"] == 0 else 1
 
 
-def download_lecture(args, downloader: RareStudyDownloader, ref: CourseRef, lecture: Lecture, output: Path, state: StateStore, base_dir: Path, show_progress: bool = True) -> str:
-    expected = duration_to_seconds(lecture.duration)
-
-    if not args.force:
-        if state.is_complete(lecture.video_id, output, MIN_VALID_SIZE):
-            log(f"  skip   {lecture.name} (verified)")
-            return "skipped"
-        if output.exists() and output.stat().st_size >= MIN_VALID_SIZE:
-            ok, measured = verify_output(output, expected, args.verify)
-            if ok:
-                state.record(lecture.video_id, output, base_dir, measured, verified=args.verify)
-                log(f"  skip   {lecture.name} (verified)")
-                return "skipped"
-            log(f"  redo   {lecture.name} (existing file failed verification)")
-
-    page_url = lecture.page_url(ref.program_id, ref.subject_id)
-    attempts = max(1, args.retries)
-    for attempt in range(1, attempts + 1):
-        try:
-            info = downloader.resolve(page_url, container=args.container)
-            downloader.download(info, output, quality=args.quality, work_key=lecture.video_id, show_progress=show_progress, logger=log)
-            ok, measured = verify_output(output, expected, args.verify)
-            if not ok:
-                raise DownloadError(
-                    f"verification failed: got {measured}s, expected {lecture.duration or 'unknown'}"
-                )
-            state.record(lecture.video_id, output, base_dir, measured, verified=args.verify)
-            log(f"  done   {lecture.name}")
-            return "downloaded"
-        except (DownloadError, ResolveError, requests.RequestException) as exc:
-            if attempt < attempts:
-                wait = min(30, 2 * attempt)
-                log(f"  retry  {lecture.name} (attempt {attempt}/{attempts}): {exc}")
-                time.sleep(wait)
-            else:
-                log(f"  FAILED {lecture.name}: {exc}")
-    return "failed"
-
-
 def main(argv=None) -> int:
+    _enable_utf8_output()
     args = build_parser().parse_args(argv)
 
     if not args.url:
@@ -313,18 +278,17 @@ def main(argv=None) -> int:
         print(f"Cookies file not found: {args.cookies}", file=sys.stderr)
         return 1
 
-    try:
-        cookies = load_cookies(Path(args.cookies))
-    except Exception as exc:
-        print(f"Failed to load cookies: {exc}", file=sys.stderr)
+    store = CookieStore(Path(args.cookies))
+    if not store.has_cookies:
+        print(f"Failed to load cookies: {store.last_error}", file=sys.stderr)
         return 1
 
-    downloader = RareStudyDownloader(cookies=cookies, base_url=BASE_URL, workers=args.workers)
+    downloader = RareStudyDownloader(cookies=store.cookies, base_url=BASE_URL, workers=args.workers)
     path = urlparse(args.url).path
 
     try:
         if path.endswith("/khazana-chapters"):
-            return download_collection(args, downloader, cookies)
+            return download_collection(args, downloader, store)
         return download_single(args, downloader)
     except KeyboardInterrupt:
         print("\nInterrupted.")

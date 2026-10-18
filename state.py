@@ -22,7 +22,7 @@ class StateStore:
     def _load(self) -> dict:
         if self.path.exists():
             try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
+                data = json.loads(self.path.read_text(encoding="utf-8-sig"))
                 if isinstance(data, dict) and isinstance(data.get("videos"), dict):
                     return data
             except (ValueError, OSError):
@@ -51,9 +51,13 @@ class StateStore:
             rel = str(output.relative_to(base_dir))
         except ValueError:
             rel = output.name
+        try:
+            size = output.stat().st_size
+        except OSError:
+            return
         entry = {
             "file": rel,
-            "size": output.stat().st_size,
+            "size": size,
             "duration": round(duration, 3) if duration is not None else None,
             "verified": bool(verified),
             "updated": int(time.time()),
@@ -63,7 +67,11 @@ class StateStore:
             self._save()
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+            tmp.replace(self.path)
+        except OSError:
+            # Best effort: a locked/unwritable manifest must not fail the download.
+            pass

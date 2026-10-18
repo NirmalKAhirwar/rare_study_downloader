@@ -1,142 +1,30 @@
+import json
+import re
 import shutil
-import subprocess
+import sys
 from pathlib import Path
-from datetime import datetime
-import logging
-import time 
-import os 
-import signal
-import json 
-from typing import Dict, Any
+from typing import Dict, Optional
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import re
 
 from config import COOKIES_FILE, MAX_RETRIES, RETRY_BACKOFF
 
-def clip_number(p: Path):
-    m = re.search(r"clip_(\d+)", p.name)
-    return int(m.group(1)) if m else -1
-
-def save_json(data: Dict[str, Any], filename: str = "followed_rooms.json"):
-    """Save JSON to file."""
-
-    try:
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
-
-        print(f"💾 Saved JSON → {filename}")
-
-    except Exception as e:
-        print("❌ Save error:", e)
-
-def load_json(filename: str = "followed_rooms.json") -> Dict[str, Any]:
-    """Load JSON from file."""
-
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        print(f"📂 Loaded JSON → {filename}")
-        return data
-
-    except Exception as e:
-        print("❌ Load error:", e)
-        return {}
-
-def check_disk_space():
-    total, used, free = shutil.disk_usage("/")
-    return (free / (1024 ** 3)) >= MIN_FREE_GB
-
-def get_today_folder(model_name: str):
-    folder = BASE_RECORDINGS_DIR / model_name / datetime.now().strftime("%Y-%m-%d")
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
-
-
-def merge_segments(folder: Path, model_name: str):
-    """
-    Merge all segments in folder into a single FULL_<model>.mp4 file.
-    If FULL_<model>.mp4 already exists, append timestamp to avoid overwrite.
-    After merging, delete all segment files.
-    """
-    time.sleep(2)
-    
-    clips = sorted(
-        folder.glob("clip_*.mp4"),
-        key=clip_number
-    )
-    # print(clips)
-    if not clips:
-        logging.info(f"{model_name}: No segments to merge.")
-        return None
-    
-    # printing all clips files
-    # for c in clips:
-    #     print(c.name)
-
-    # Generate merged file name
-    merged_file = folder / f"FULL_{model_name}.mp4"
-    # if merged_file.exists():
-    #     timestamp = time.strftime("%H%M%S")
-    #     merged_file = folder / f"FULL_{model_name}_{timestamp}.mp4"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    merged_file = folder / f"FULL_{model_name}_{timestamp}.mp4"
-
-    list_file = folder / "files.txt"
-    with open(list_file, "w", encoding="utf-8") as f:
-        for clip in clips:
-            f.write(f"file '{clip.name}'\n")
-
-    logging.info(f"{model_name}: Merging {len(clips)} segments into {merged_file.name}")
-    subprocess.run([
-        "ffmpeg",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(list_file),
-        "-c", "copy",
-        str(merged_file)
-    ])
-
-    # Delete the segment files after merging
-    for clip in clips:
-        try:
-            clip.unlink()
-        except Exception as e:
-            logging.warning(f"{model_name}: Failed to delete segment {clip.name}: {e}")
-
-    # list_file.unlink(missing_ok=True)
-    logging.info(f"{model_name}: Merge complete and segments deleted.")
-    return merged_file
-
-def kill_process(process):
-    try:
-        os.killpg(
-            os.getpgid(process.pid),
-            signal.SIGKILL,
-        )
-    except Exception:
-        process.terminate()
-        
-        
-def ensure_disk_space(model_name: str) -> bool:
-
-    if not check_disk_space():
-        logging.warning(
-            f"{model_name}: Low disk space. Sleeping 60s."
-        )
-
-        time.sleep(10)
-        return False
-
-    return True
+_WINDOWS_RESERVED = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
 
 def load_cookies(path: Path = COOKIES_FILE) -> Dict[str, str]:
     """Load cookies from a browser-export JSON (list) or a plain name->value dict."""
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         raw = json.load(f)
 
     if isinstance(raw, dict):
@@ -171,12 +59,19 @@ def create_session(cookies: Dict[str, str]) -> requests.Session:
 
 
 def sanitize_filename(name: str, fallback: str = "video") -> str:
-    """Turn an arbitrary string into a safe file name."""
+    """Turn an arbitrary string into a file name safe on macOS and Windows.
+
+    Strips control characters and Windows-invalid characters, collapses
+    whitespace, avoids trailing dots/spaces and reserved device names.
+    """
 
     name = re.sub(r"[\x00-\x1f]", "", str(name or "")).strip()
     name = re.sub(r'[<>:"/\\|?*]+', "_", name)
-    name = re.sub(r"\s+", " ", name).strip(" ._")
-    return name[:150] or fallback
+    name = re.sub(r"\s+", " ", name)
+    name = name[:150].rstrip(" .")
+    if name.split(".")[0].upper() in _WINDOWS_RESERVED:
+        name = f"_{name}"
+    return name or fallback
 
 
 def duration_to_seconds(value) -> float:
@@ -210,4 +105,28 @@ def human_bytes(num: float) -> str:
     return f"{num:.1f}PB"
 
 
+def free_space_bytes(path: Path) -> Optional[int]:
+    """Free bytes on the volume holding `path` (walks up to an existing folder)."""
 
+    probe = Path(path)
+    while True:
+        try:
+            return shutil.disk_usage(probe).free
+        except OSError:
+            if probe.parent == probe:
+                return None
+            probe = probe.parent
+
+
+def tool_hint(tool: str = "ffmpeg") -> str:
+    """Platform-specific install instructions for a missing external tool."""
+
+    if sys.platform == "win32":
+        return (
+            f"{tool} was not found on PATH. Install it (e.g. 'winget install Gyan.FFmpeg') "
+            "and reopen your terminal, or set the FFMPEG/FFPROBE environment variables."
+        )
+    return (
+        f"{tool} was not found on PATH. Install it with 'brew install ffmpeg', "
+        "or set the FFMPEG/FFPROBE environment variables."
+    )

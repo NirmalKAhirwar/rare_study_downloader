@@ -1,12 +1,14 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from config import API_PROXY_BASE, BASE_URL, MAX_RETRIES, RETRY_BACKOFF
+from config import API_PROXY_BASE, BASE_URL, MAX_RETRIES, RETRY_BACKOFF, USER_AGENT
 from utils import sanitize_filename
 
 
@@ -78,18 +80,25 @@ class CourseRef:
 
 
 class Catalog:
+    """API client. One HTTP session per thread so pages can be fetched in parallel."""
+
     def __init__(self, cookies: Dict[str, str], referer: str = BASE_URL):
-        self.session = requests.Session()
-        self.session.cookies.update(cookies)
-        self.session.headers.update(
+        self.referer = referer
+        self.cookies = dict(cookies)
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._sessions: List[requests.Session] = []
+        self.session = self._new_session()
+
+    def _new_session(self) -> requests.Session:
+        session = requests.Session()
+        session.cookies.update(self.cookies)
+        session.headers.update(
             {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.3"
-                ),
+                "User-Agent": USER_AGENT,
                 "Accept": "*/*",
                 "Origin": BASE_URL,
-                "Referer": referer.rstrip("/") + "/",
+                "Referer": self.referer.rstrip("/") + "/",
             }
         )
         retry = Retry(
@@ -99,13 +108,32 @@ class Catalog:
             allowed_methods=frozenset({"GET"}),
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        with self._lock:
+            self._sessions.append(session)
+        return session
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._new_session()
+            self._local.session = session
+        return session
+
+    def set_cookies(self, cookies: Dict[str, str]) -> None:
+        """Replace the cookies on every session (used when cookies.json changes)."""
+
+        self.cookies = dict(cookies)
+        with self._lock:
+            for session in self._sessions:
+                session.cookies.clear()
+                session.cookies.update(self.cookies)
 
     def _get_json(self, path: str, params: Optional[dict] = None) -> dict:
         url = f"{API_PROXY_BASE}/{path.lstrip('/')}"
-        resp = self.session.get(url, params=params, timeout=60)
+        resp = self._session().get(url, params=params, timeout=60)
         resp.raise_for_status()
         try:
             return resp.json()
@@ -155,16 +183,75 @@ class Catalog:
     def lectures(self, ref: CourseRef, chapter: Chapter) -> List[Lecture]:
         if chapter.lectures:
             return chapter.lectures
-        base = (
-            f"v2/programs/{ref.program_id}/subjects/{ref.subject_id}"
-            f"/chapters/{ref.chapter_id}/topics/{chapter.id}"
-        )
+        base = self._chapter_base(ref, chapter)
         sections = self._paginate(f"{base}/contents/sub-topic")
-        lectures: List[Lecture] = []
+        entries: List[Tuple[str, List[dict]]] = []
         for section in sections:
             section_id = section.get("_id", "")
             section_name = section.get("name") or ""
+            entries.append((section_name, self._paginate(f"{base}/sub-topic/{section_id}/contents")))
+        self._fill(chapter, entries)
+        return chapter.lectures
+
+    def load_lectures(
+        self,
+        ref: CourseRef,
+        chapters: List[Chapter],
+        workers: int = 8,
+        on_progress: Optional[Callable[[str], None]] = None,
+    ) -> List[Chapter]:
+        """Fill every chapter's lectures, fetching sections in parallel (much faster)."""
+
+        pending = [chapter for chapter in chapters if not chapter.lectures]
+        if not pending:
+            return chapters
+        workers = max(1, min(int(workers), 16))
+        done = 0
+        total = len(pending)
+        if on_progress:
+            on_progress(f"Fetching lectures for {total} chapter(s)…")
+
+        def fetch_sections(chapter: Chapter) -> Tuple[Chapter, List[dict]]:
+            base = self._chapter_base(ref, chapter)
+            return chapter, self._paginate(f"{base}/contents/sub-topic")
+
+        def fetch_contents(job: Tuple[Chapter, int, dict]) -> Tuple[Chapter, int, str, List[dict]]:
+            chapter, index, section = job
+            base = self._chapter_base(ref, chapter)
+            section_id = section.get("_id", "")
             contents = self._paginate(f"{base}/sub-topic/{section_id}/contents")
+            return chapter, index, section.get("name") or "", contents
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            section_lists = list(pool.map(fetch_sections, pending))
+            jobs = [
+                (chapter, index, section)
+                for chapter, sections in section_lists
+                for index, section in enumerate(sections)
+            ]
+            fetched = list(pool.map(fetch_contents, jobs)) if jobs else []
+
+        grouped: Dict[int, List[Tuple[int, str, List[dict]]]] = {}
+        for chapter, index, name, contents in fetched:
+            grouped.setdefault(id(chapter), []).append((index, name, contents))
+
+        for chapter, _sections in section_lists:
+            entries = sorted(grouped.get(id(chapter), []))
+            self._fill(chapter, [(name, contents) for _index, name, contents in entries])
+            done += 1
+            if on_progress:
+                on_progress(f"Loaded {done}/{total} chapter(s)…")
+        return chapters
+
+    def _chapter_base(self, ref: CourseRef, chapter: Chapter) -> str:
+        return (
+            f"v2/programs/{ref.program_id}/subjects/{ref.subject_id}"
+            f"/chapters/{ref.chapter_id}/topics/{chapter.id}"
+        )
+
+    def _fill(self, chapter: Chapter, entries: List[Tuple[str, List[dict]]]) -> None:
+        lectures: List[Lecture] = []
+        for section_name, contents in entries:
             for item in contents:
                 lecture = self._to_lecture(item, section_name)
                 if lecture:
@@ -172,7 +259,6 @@ class Catalog:
         for idx, lecture in enumerate(lectures, 1):
             lecture.order = idx
         chapter.lectures = lectures
-        return lectures
 
     def _to_lecture(self, item: dict, section_name: str) -> Optional[Lecture]:
         if str(item.get("type", "")).upper() != "LECTURE":
