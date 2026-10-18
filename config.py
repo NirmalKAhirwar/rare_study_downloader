@@ -10,6 +10,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 COOKIES_FILE = PROJECT_DIR / "cookies.json"
 DOWNLOAD_DIR = PROJECT_DIR / "downloads"
 TEMP_DIR = DOWNLOAD_DIR / ".tmp"
+TOOLS_DIR = PROJECT_DIR / ".tools" / "ffmpeg"
 
 
 def _platform_token() -> str:
@@ -59,14 +60,18 @@ VIDEO_DOWNLOAD_WORKERS = 3
 VIDEO_DOWNLOAD_ATTEMPTS = 3
 
 def _resolve_tool(name: str) -> str:
-    """Locate an external tool: env override, then PATH, then the bare name.
+    """Locate ffmpeg/ffprobe: bundled download, env override, then PATH.
 
-    Set FFMPEG / FFPROBE env vars to point at a specific binary.
+    `setup_env.py` can download the binaries into `.tools/ffmpeg/`; they are used
+    automatically when present. Set FFMPEG / FFPROBE to force a specific binary.
     """
 
     override = os.environ.get(name.upper())
     if override:
         return override
+    bundled = TOOLS_DIR / f"{name}.exe" if os.name == "nt" else TOOLS_DIR / name
+    if bundled.exists():
+        return str(bundled)
     return shutil.which(name) or name
 
 
@@ -75,4 +80,7 @@ FFPROBE = _resolve_tool("ffprobe")
 
 
 def tool_missing(tool: str) -> bool:
+    separators = [sep for sep in (os.sep, os.altsep) if sep]
+    if any(sep in tool for sep in separators):
+        return not Path(tool).exists()
     return shutil.which(tool) is None

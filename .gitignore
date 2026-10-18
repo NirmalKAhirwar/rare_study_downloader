@@ -10,6 +10,9 @@ wheels/
 .venv
 .history
 
+# Bundled tool binaries downloaded by setup_env.py
+.tools/
+
 # Downloaded media
 downloads/
 

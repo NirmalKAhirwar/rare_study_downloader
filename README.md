@@ -20,7 +20,7 @@ dependencies.
 ## Requirements
 
 - Python 3.12+
-- `ffmpeg` + `ffprobe` on `PATH`
+- `ffmpeg` + `ffprobe` (installed for you by `setup_env.py`, or on `PATH`)
 - A valid `cookies.json` exported from your logged-in browser session
 - Python dependencies are installed for you in step 4 (`requests`, `beautifulsoup4`, and
   `PyQt6` only for the GUI)
@@ -41,6 +41,11 @@ Confirm it is on `PATH`: `python3 --version` (macOS) / `python --version` (Windo
 should print `3.12` or newer.
 
 ### 2. Install ffmpeg + ffprobe
+
+You can let step 4 do this for you — `setup_env.py` finds an existing install, uses a
+package manager (`brew` on macOS, `winget`/`choco`/`scoop` on Windows), or downloads a
+standalone build into `.tools/ffmpeg/` that the app picks up automatically. To install it
+yourself instead:
 
 | macOS | Windows |
 | --- | --- |
@@ -75,13 +80,15 @@ python setup_env.py
 ```
 
 `setup_env.py` creates `.venv/`, installs the engine and GUI dependencies read straight
-from `pyproject.toml`, and reports whether `ffmpeg`/`ffprobe` were found. It is safe to
-re-run at any time.
+from `pyproject.toml`, and sets up `ffmpeg`/`ffprobe` (existing install, package manager,
+or a downloaded copy in `.tools/ffmpeg/`). It is safe to re-run at any time.
 
 Handy flags:
 
 - `python setup_env.py --cli-only` — skip `PyQt6` (smaller, command line only)
 - `python setup_env.py --recreate` — delete `.venv/` and rebuild it cleanly
+- `python setup_env.py --download-ffmpeg` — always download a private copy into `.tools/ffmpeg/`
+- `python setup_env.py --skip-ffmpeg` — leave ffmpeg/ffprobe untouched
 
 Prefer [uv](https://docs.astral.sh/uv/)? The equivalent is:
 
@@ -271,7 +278,7 @@ seeing `403`/Cloudflare errors, lower them:
 
 | File | Purpose |
 | --- | --- |
-| `setup_env.py` | One-command setup: creates `.venv`, installs all dependencies, checks ffmpeg/ffprobe |
+| `setup_env.py` | One-command setup: creates `.venv`, installs all dependencies, and installs/checks ffmpeg/ffprobe |
 | `main.py` | CLI: argument parsing, mode detection, interactive selection, batch orchestration |
 | `gui.py` | GUI entry point (`python gui.py`) |
 | `jobs.py` | Shared job layer: collection planning, parallel crawl + chapter-list cache, per-video job with status/progress/cancel |
